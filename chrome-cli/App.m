@@ -413,11 +413,15 @@ static NSString * const kJsPrintSource = @"(function() { return document.getElem
 - (void)activateTab:(Arguments *)args {
     NSInteger tabId = [args asInteger:@"id"];
 
-    // Find tab and the window that the tab resides in
-    chromeTab *tab = [self findTab:tabId];
-    chromeWindow *window = [self findWindowWithTab:tab];
-
-    [self setTabActive:tab inWindow:window];
+    // Find tab, window, and index in a single pass for optimal performance
+    chromeTab *tab = nil;
+    chromeWindow *window = nil;
+    NSInteger index = NSNotFound;
+    [self findTab:tabId returningTab:&tab window:&window andIndex:&index];
+    
+    if (tab && window && index != NSNotFound) {
+        window.activeTabIndex = index;
+    }
 }
 
 - (void)printActiveWindowSize:(Arguments *)args {
@@ -684,6 +688,43 @@ static NSString * const kJsPrintSource = @"(function() { return document.getElem
 - (void)setTabActive:(chromeTab *)tab inWindow:(chromeWindow *)window {
     NSInteger index = [self findTabIndex:tab inWindow:window];
     window.activeTabIndex = index;
+}
+
+// Optimized method that finds both tab and window in a single pass
+- (void)findTab:(NSInteger)tabId returningTab:(chromeTab **)tab andWindow:(chromeWindow **)window {
+    *tab = nil;
+    *window = nil;
+    
+    for (chromeWindow *w in self.chrome.windows) {
+        chromeTab *t = [w.tabs objectWithID:@(tabId)];
+        if (t && t.id) {
+            *tab = t;
+            *window = w;
+            return;
+        }
+    }
+}
+
+// New optimized method that finds tab, window, and index in a single pass
+- (void)findTab:(NSInteger)tabId returningTab:(chromeTab **)tab window:(chromeWindow **)window andIndex:(NSInteger *)index {
+    *tab = nil;
+    *window = nil;
+    *index = NSNotFound;
+    
+    NSString *targetTabId = [@(tabId) stringValue];
+    
+    for (chromeWindow *w in self.chrome.windows) {
+        NSInteger i = 1; // Tab index starts at 1
+        for (chromeTab *t in w.tabs) {
+            if ([t.id isEqualToString:targetTabId]) {
+                *tab = t;
+                *window = w;
+                *index = i;
+                return;
+            }
+            i++;
+        }
+    }
 }
 
 - (chromeTab *)findTab:(NSInteger)tabId {
