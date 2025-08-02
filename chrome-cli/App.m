@@ -25,6 +25,10 @@ static NSString * const kJsPrintSource = @"(function() { return document.getElem
     self = [super init];
     self->bundleIdentifier = bundleIdentifier;
     self->outputFormat = outputFormat;
+    
+    // Load cache from disk (or initialize empty)
+    [self loadCacheFromDisk];
+    
     return self;
 }
 
@@ -412,8 +416,51 @@ static NSString * const kJsPrintSource = @"(function() { return document.getElem
 
 - (void)activateTab:(Arguments *)args {
     NSInteger tabId = [args asInteger:@"id"];
-
-    // Find tab, window, and index in a single pass for optimal performance
+    NSString *tabIdStr = [@(tabId) stringValue];
+    
+    NSTimeInterval startTime = [[NSDate date] timeIntervalSince1970];
+    
+    // Try cached approach first
+    [self refreshTabCacheIfNeeded];
+    
+    NSTimeInterval cacheTime = [[NSDate date] timeIntervalSince1970];
+    NSDictionary *tabInfo = self.tabCache[tabIdStr];
+    NSTimeInterval cacheLookupTime = ([[NSDate date] timeIntervalSince1970] - cacheTime) * 1000;
+    
+    if (tabInfo) {
+        NSString *windowIdStr = tabInfo[@"windowId"];
+        NSNumber *indexNum = tabInfo[@"index"];
+        
+        if (windowIdStr && indexNum) {
+            // Get window object from cached windowId
+            chromeWindow *window = [self findWindow:[windowIdStr integerValue]];
+            
+            if (!window) {
+                if (self->outputFormat == kOutputFormatText) {
+                    printf("Debug: Window %s not found, cache may be stale\n", [windowIdStr UTF8String]);
+                }
+                // Force cache refresh and try fallback
+                [self forceRefreshTabCache];
+            } else {
+                @try {
+                    // Use Scripting Bridge for tab activation
+    window.activeTabIndex = [indexNum integerValue];
+                
+                // Save cache to disk after successful activation
+                [self saveCacheToDisk];
+                return;
+            } @catch (NSException *exception) {
+                // Tab probably doesn't exist anymore - force cache refresh
+                if (self->outputFormat == kOutputFormatText) {
+                    printf("Cache miss - tab may have been closed, refreshing...\n");
+                }
+                [self forceRefreshTabCache];
+            }
+            } // Close the else block
+        }
+    }
+    
+    // Fallback to direct tab search
     chromeTab *tab = nil;
     chromeWindow *window = nil;
     NSInteger index = NSNotFound;
@@ -421,6 +468,8 @@ static NSString * const kJsPrintSource = @"(function() { return document.getElem
     
     if (tab && window && index != NSNotFound) {
         window.activeTabIndex = index;
+    } else if (self->outputFormat == kOutputFormatText) {
+        printf("Tab %ld not found\n", (long)tabId);
     }
 }
 
@@ -725,6 +774,97 @@ static NSString * const kJsPrintSource = @"(function() { return document.getElem
             i++;
         }
     }
+}
+
+#pragma mark Cache Management
+
+// Get cache file path
+- (NSString *)cacheFilePath {
+    NSString *tempDir = NSTemporaryDirectory();
+    NSString *bundleHash = [NSString stringWithFormat:@"%lu", (unsigned long)[self->bundleIdentifier hash]];
+    return [tempDir stringByAppendingPathComponent:[NSString stringWithFormat:@"chrome-cli-cache-%@.plist", bundleHash]];
+}
+
+// Load cache from disk
+- (void)loadCacheFromDisk {
+    NSString *cachePath = [self cacheFilePath];
+    
+    NSDictionary *diskCache = [NSDictionary dictionaryWithContentsOfFile:cachePath];
+    
+    if (diskCache) {
+        NSTimeInterval savedTime = [diskCache[@"timestamp"] doubleValue];
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        NSTimeInterval age = now - savedTime;
+        
+        // Only use cache if it's less than 300 seconds old
+        if (age < 300.0) {
+            self.tabCache = [diskCache[@"cache"] mutableCopy];
+            self.lastCacheUpdate = savedTime;
+            
+            if (self->outputFormat == kOutputFormatText) {
+                printf("Using cached tab information\n");
+            }
+            return;
+        }
+    }
+    
+    // Initialize empty cache if no valid disk cache
+    self.tabCache = [[NSMutableDictionary alloc] init];
+    self.lastCacheUpdate = 0;
+}
+
+// Save cache to disk
+- (void)saveCacheToDisk {
+    if (self.tabCache.count == 0) {
+        return;
+    }
+    
+    NSString *cachePath = [self cacheFilePath];
+    NSDictionary *diskCache = @{
+        @"timestamp": @(self.lastCacheUpdate),
+        @"cache": self.tabCache
+    };
+    
+    [diskCache writeToFile:cachePath atomically:YES];
+}
+
+
+
+- (void)refreshTabCacheIfNeeded {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    
+    // Only refresh cache every 300 seconds (5 minutes) or if empty
+    if (now - self.lastCacheUpdate < 300.0 && self.tabCache.count > 0) {
+        return;
+    }
+    
+    [self.tabCache removeAllObjects];
+    
+    // Build cache of all tabs
+    for (chromeWindow *window in self.chrome.windows) {
+        NSString *windowIdStr = window.id;
+        SBElementArray *tabs = window.tabs;
+        
+        for (NSUInteger i = 0; i < tabs.count; i++) {
+            chromeTab *tab = [tabs objectAtIndex:i];
+            NSString *tabIdStr = tab.id;
+            
+            if (tabIdStr && windowIdStr) {
+                self.tabCache[tabIdStr] = @{
+                    @"windowId": windowIdStr,
+                    @"index": @(i + 1) // Chrome uses 1-indexed tabs
+                };
+            }
+        }
+    }
+    
+    self.lastCacheUpdate = now;
+    [self saveCacheToDisk];
+}
+
+- (void)forceRefreshTabCache {
+    self.lastCacheUpdate = 0; // Force refresh on next call
+    [self refreshTabCacheIfNeeded];
 }
 
 - (chromeTab *)findTab:(NSInteger)tabId {

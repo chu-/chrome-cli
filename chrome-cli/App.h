@@ -18,6 +18,10 @@ typedef enum {
 
 @interface App : NSObject
 
+// Caching properties for performance optimization
+@property (nonatomic, strong) NSMutableDictionary *tabCache;
+@property (nonatomic, assign) NSTimeInterval lastCacheUpdate;
+
 - (id)initWithBundleIdentifier:(NSString *)bundleIdentifier outputFormat:(OutputFormat)outputFormat;
 - (void)listWindows:(Arguments *)args;
 - (void)listTabs:(Arguments *)args;
